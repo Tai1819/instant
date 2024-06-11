@@ -1,0 +1,11 @@
+diffusers==0.25.1
+transformers==4.38.0
+accelerate
+safetensors
+einops
+onnxruntime-gpu
+omegaconf
+peft
+huggingface-hub==0.20.2
+opencv-python
+insightface==0.7.3

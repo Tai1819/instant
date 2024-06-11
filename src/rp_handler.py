@@ -11,20 +11,17 @@ from PIL import Image, ImageOps
 
 import diffusers
 from diffusers.models import ControlNetModel
-
-import insightface
 from insightface.app import FaceAnalysis
-
+from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from style_template import styles
 from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline
-from model_util import load_models_xl, get_torch_device, torch_gc
+from model_util import get_torch_device
 
 import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
 
 from io import BytesIO
-from huggingface_hub import hf_hub_download
 from schemas.input import INPUT_SCHEMA
 
 # Global variables
@@ -32,11 +29,11 @@ MAX_SEED = np.iinfo(np.int32).max
 device = get_torch_device()
 dtype = torch.float16 if str(device).__contains__('cuda') else torch.float32
 STYLE_NAMES = list(styles.keys())
-DEFAULT_MODEL = 'wangqixun/YamerMIX_v8'
+DEFAULT_MODEL = './YamerMIX_v8'
 DEFAULT_STYLE_NAME = 'Watercolor'
 
 # Load face encoder
-app = FaceAnalysis(name='antelopev2', root='./', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+app = FaceAnalysis(name='antelopev2', root='./', providers=['CPUExecutionProvider'])
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 # Path to InstantID models
@@ -46,9 +43,26 @@ controlnet_path = f'./checkpoints/ControlNetModel'
 # Load pipeline
 controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=dtype)
 
+controlnet_canny_model = "./controlnet-canny-sdxl-1.0"
 logger = RunPodLogger()
+controlnet_identitynet = ControlNetModel.from_pretrained(
+    controlnet_path, torch_dtype=dtype
+)
+controlnet_canny = ControlNetModel.from_pretrained(
+    controlnet_canny_model, torch_dtype=dtype
+).to(device)
 
 
+def get_canny_image(image, t1=100, t2=200):
+    image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    edges = cv2.Canny(image, t1, t2)
+    return Image.fromarray(edges, "L")
+controlnet_map = {
+    "canny": controlnet_canny,
+}
+controlnet_map_fn = {
+    "canny": get_canny_image,
+}
 # ---------------------------------------------------------------------------- #
 # Application Functions                                                        #
 # ---------------------------------------------------------------------------- #
@@ -88,51 +102,20 @@ def determine_file_extension(image_data):
 
 
 def get_instantid_pipeline(pretrained_model_name_or_path):
-    if pretrained_model_name_or_path.endswith(
-            '.ckpt'
-    ) or pretrained_model_name_or_path.endswith('.safetensors'):
-        scheduler_kwargs = hf_hub_download(
-            repo_id='wangqixun/YamerMIX_v8',
-            subfolder='scheduler',
-            filename='scheduler_config.json',
-        )
+    pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
+        pretrained_model_name_or_path,
+        controlnet=controlnet,
+        torch_dtype=dtype,
+        safety_checker=None,
+        feature_extractor=None,
+    ).to(device)
 
-        (tokenizers, text_encoders, unet, _, vae) = load_models_xl(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            scheduler_name=None,
-            weight_dtype=dtype,
-        )
-
-        scheduler = diffusers.EulerDiscreteScheduler.from_config(scheduler_kwargs)
-        pipe = StableDiffusionXLInstantIDPipeline(
-            vae=vae,
-            text_encoder=text_encoders[0],
-            text_encoder_2=text_encoders[1],
-            tokenizer=tokenizers[0],
-            tokenizer_2=tokenizers[1],
-            unet=unet,
-            scheduler=scheduler,
-            controlnet=controlnet,
-        ).to(device)
-
-    else:
-        pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
-            pretrained_model_name_or_path,
-            controlnet=controlnet,
-            torch_dtype=dtype,
-            safety_checker=None,
-            feature_extractor=None,
-        ).to(device)
-
-        pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-
+    pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe.load_ip_adapter_instantid(face_adapter)
 
     return pipe
 
-
-CURRENT_MODEL = DEFAULT_MODEL
-PIPELINE = get_instantid_pipeline(CURRENT_MODEL)
+PIPELINE = get_instantid_pipeline(DEFAULT_MODEL)
 
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
@@ -225,15 +208,12 @@ def generate_image(
         ):
 
     global CURRENT_MODEL, PIPELINE
-
+    controlnet_selection = ["canny"]
     if face_image is None:
         raise Exception(f'Cannot find any input face image! Please upload the face image')
 
     if prompt is None:
         prompt = 'a person'
-
-    # apply the style template
-    prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
 
     if width == 0 and height == 0:
         resize_size = None
@@ -255,10 +235,11 @@ def generate_image(
     face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*x['bbox'][3]-x['bbox'][1])[-1]  # only use the maximum face
     face_emb = face_info['embedding']
     face_kps = draw_kps(convert_from_cv2_to_image(face_image_cv2), face_info['kps'])
-
+    img_controlnet = face_image
     if pose_image is not None:
         pose_image = load_image(pose_image)
         pose_image = resize_img(pose_image, size=resize_size)
+        img_controlnet = pose_image
         pose_image_cv2 = convert_from_image_to_cv2(pose_image)
 
         face_info = app.get(pose_image_cv2)
@@ -270,7 +251,25 @@ def generate_image(
         face_kps = draw_kps(pose_image, face_info['kps'])
 
         width, height = face_kps.size
-
+    if len(controlnet_selection) > 0:
+        controlnet_scales = {
+            "canny": 0.3
+        }
+        PIPELINE.controlnet = MultiControlNetModel(
+            [controlnet_identitynet]
+            + [controlnet_map[s] for s in controlnet_selection]
+        )
+        control_scales = [float(identitynet_strength_ratio)] + [
+            controlnet_scales[s] for s in controlnet_selection
+        ]
+        control_images = [face_kps] + [
+            controlnet_map_fn[s](img_controlnet).resize((width, height))
+            for s in controlnet_selection
+        ]
+    else:
+        PIPELINE.controlnet = controlnet_identitynet
+        control_scales = float(identitynet_strength_ratio)
+        control_images = face_kps
     generator = torch.Generator(device=device).manual_seed(seed)
 
     logger.info('Start inference...', job_id)
@@ -287,8 +286,8 @@ def generate_image(
         prompt=prompt,
         negative_prompt=negative_prompt,
         image_embeds=face_emb,
-        image=face_kps,
-        controlnet_conditioning_scale=float(identitynet_strength_ratio),
+        image=control_images,
+        controlnet_conditioning_scale=control_scales,
         num_inference_steps=num_steps,
         guidance_scale=guidance_scale,
         height=height,
